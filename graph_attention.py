@@ -14,6 +14,11 @@ from performer_pytorch import default, cast_tuple, find_modules, get_module_devi
 from performer_pytorch import FastAttention, SelfAttention, Gene2VecPositionalEmbedding
 from performer_pytorch import PreLayerNorm, PreScaleNorm, ReZero, Chunk, Always, FeedForward
 
+###################################################################################################
+# Graph-based cross-attention:                                                                    #
+# - Operates on nodes with 2D features (tokens x token_dim)                                       #
+# - For a given node, computes average K, V matrices across neighbors                             #
+###################################################################################################
 
 class CrossAttention(MessagePassing):
     def __init__(
@@ -98,6 +103,14 @@ class CrossAttention(MessagePassing):
         else:
             return self.dropout(out)
 
+###################################################################################################
+# WRAPPER CLASSES:                                                                                #
+# - BERST has two types of attention: self (within node) and cross (between nodes)                #
+# - Cross-attention requires an additional argument to forward() -- edge_index                    #
+# - Rather than making an explicit argument, wrap both forward() methods to accept *args          #
+# - Makes things modular; same forward() call be be applied in a Sequential network               #
+###################################################################################################
+
 class GraphSelfAttention(SelfAttention):
 	def forward(self, x, *args, **kwargs):
 		return super(GraphSelfAttention, self).forward(x, **kwargs)
@@ -108,6 +121,12 @@ class GraphCrossAttention(CrossAttention):
             raise ValueError("GraphCrossAttention expects 'edge_index' as a second argument")
         edge_index = args[0]
         return super(GraphCrossAttention, self).forward(x, edge_index, **kwargs)
+
+###################################################################################################
+# scBERT-based implementation of language models                                                  #
+# - Alternately apply SelfAttention and CrossAttention up to desired depth                        #
+# - ...with token-level FeedForward layers to provide post-processing between Attention layers    #
+###################################################################################################
 
 class GraphPerformer(nn.Module):
     def __init__(
@@ -189,9 +208,6 @@ class GraphPerformer(nn.Module):
         self.calls_since_last_redraw += 1
 
     def forward(self, x, *args, output_attentions = False, **kwargs):
-        print('GraphPerformer')
-        print(args)
-        print(kwargs)
         if self.auto_check_redraw:
             self.check_redraw_projections()
         return self.net(x, *args, output_attentions = output_attentions, **kwargs)

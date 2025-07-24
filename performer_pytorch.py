@@ -275,7 +275,12 @@ class FastAttention(nn.Module):
             return out
 
 # classes
-
+'''
+NOTE:
+- ReZero, PreScaleNorm, PreLayerNorm, and Chunk are all applied sequentially with Self/CrossAttention
+- "*args" has been added to forward() calls of each so they can accept additional "edge_index" argument
+  required for graph-based CrossAttention
+'''
 class ReZero(nn.Module):
     def __init__(self, fn):
         super().__init__()

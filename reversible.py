@@ -135,13 +135,10 @@ class SequentialSequence(nn.Module):
         self.layers = layers
         self.args_route = args_route
 
+    # "*args" has been added so this can be called with (CrossAttention) or without (SelfAttention) edge_index argument
     def forward(self, x, *args, output_attentions = False, **kwargs):
         rtargs = route_args(self.args_route, kwargs, len(self.layers))
         layers_and_args = list(zip(self.layers, rtargs))
-
-        print('SequentialSequence')
-        print(args)
-        print(kwargs)
 
         if output_attentions:
             attn_weights = []
