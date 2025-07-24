@@ -135,9 +135,13 @@ class SequentialSequence(nn.Module):
         self.layers = layers
         self.args_route = args_route
 
-    def forward(self, x, output_attentions = False, **kwargs):
-        args = route_args(self.args_route, kwargs, len(self.layers))
-        layers_and_args = list(zip(self.layers, args))
+    def forward(self, x, *args, output_attentions = False, **kwargs):
+        rtargs = route_args(self.args_route, kwargs, len(self.layers))
+        layers_and_args = list(zip(self.layers, rtargs))
+
+        print('SequentialSequence')
+        print(args)
+        print(kwargs)
 
         if output_attentions:
             attn_weights = []
@@ -146,11 +150,11 @@ class SequentialSequence(nn.Module):
         # - g: FeedForward block; g_args: args passed to FeedForward block
         for (f, g), (f_args, g_args) in layers_and_args:
             if output_attentions:
-                x = x + f(x, output_attentions = output_attentions, **f_args)[0]
+                x = x + f(x, *args, output_attentions = output_attentions, **f_args)[0]
                 attn_weights.append(f(x, output_attentions = output_attentions, **f_args)[1].unsqueeze(0))
             else:
-                x = x + f(x, **f_args)
-            x = x + g(x, **g_args)
+                x = x + f(x, *args, **f_args)
+            x = x + g(x, *args, **g_args)
         if output_attentions:
             attn_weights = torch.transpose(torch.cat(attn_weights, dim=0), 0, 1)    # the final dim is (batch, layer, head, len, len)
             attn_weights = torch.mean(attn_weights, dim=1)                        # the dim is (batch, head, len, len)

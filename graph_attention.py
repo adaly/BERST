@@ -10,17 +10,12 @@ from torch_geometric.nn import MessagePassing
 from einops import rearrange
 from functools import partial
 from reversible import ReversibleSequence, SequentialSequence
-from performer_pytorch import default, cast_tuple, find_modules, get_module_device
+from performer_pytorch import default, cast_tuple, find_modules, get_module_device, exists
 from performer_pytorch import FastAttention, SelfAttention, Gene2VecPositionalEmbedding
 from performer_pytorch import PreLayerNorm, PreScaleNorm, ReZero, Chunk, Always, FeedForward
 
-# Basic wrapper around SelfAttention that takes an additional argument, edge_index (dummy in this case) to match
-#   the input syntax of GraphCrossAttention, which actually employs graph structural information.
-class GraphSelfAttention(SelfAttention):
-	def forward(self, x, edge_index = None, **kwargs):
-		return super(GraphSelfAttention, self).forward(x, **kwargs)
 
-class GraphCrossAttention(MessagePassing):
+class CrossAttention(MessagePassing):
     def __init__(
         self,
         dim,
@@ -61,11 +56,8 @@ class GraphCrossAttention(MessagePassing):
         kv = torch.cat((k,v), -1)  
         return kv
 
-    def forward(self, x, edge_index = None, output_attentions = False, **kwargs):
+    def forward(self, x, edge_index, output_attentions = False, **kwargs):
         assert x.ndim == 3  # [n_nodes, n_tokens, token_dim]
-        # while required by CrossAttention, need to make into keyword arg (rather than fixed) to enable variable-length blocks
-        #   of CrossAttention, SelfAttention, and FeedForward operating on the same inputs (see: GraphPerformer.net)
-        assert edge_index is not None
         n_nodes, n_tokens, token_dim, h = *x.shape, self.heads
 
         # Calculate Q (query) at each ("target") node; to be combined with K (key), V (value) from neighboring ("source") nodes
@@ -105,6 +97,17 @@ class GraphCrossAttention(MessagePassing):
             return self.dropout(out), attn_weights
         else:
             return self.dropout(out)
+
+class GraphSelfAttention(SelfAttention):
+	def forward(self, x, *args, **kwargs):
+		return super(GraphSelfAttention, self).forward(x, **kwargs)
+
+class GraphCrossAttention(CrossAttention):
+    def forward(self, x, *args, **kwargs):
+        if len(args) == 0:
+            raise ValueError("GraphCrossAttention expects 'edge_index' as a second argument")
+        edge_index = args[0]
+        return super(GraphCrossAttention, self).forward(x, edge_index, **kwargs)
 
 class GraphPerformer(nn.Module):
     def __init__(
@@ -185,10 +188,13 @@ class GraphPerformer(nn.Module):
 
         self.calls_since_last_redraw += 1
 
-    def forward(self, x, edge_index, output_attentions = False, **kwargs):
+    def forward(self, x, *args, output_attentions = False, **kwargs):
+        print('GraphPerformer')
+        print(args)
+        print(kwargs)
         if self.auto_check_redraw:
             self.check_redraw_projections()
-        return self.net(x, edge_index = edge_index, output_attentions = output_attentions, **kwargs)
+        return self.net(x, *args, output_attentions = output_attentions, **kwargs)
 
 class GraphPerformerLM(nn.Module):
     def __init__(
@@ -248,7 +254,7 @@ class GraphPerformerLM(nn.Module):
     def fix_projection_matrices_(self):
         self.performer.fix_projection_matrices_()
 
-    def forward(self, x, edge_index, return_encodings = False, output_attentions = False, **kwargs):
+    def forward(self, x, *args, return_encodings = False, output_attentions = False, **kwargs):
         b, n, device = *x.shape, x.device
         assert n <= self.max_seq_len, f'sequence length {n} must be less than the max sequence length {self.max_seq_len}'
 
@@ -263,7 +269,7 @@ class GraphPerformerLM(nn.Module):
         layer_pos_emb = self.layer_pos_emb(x)
 
         if output_attentions:
-            x, attn_weights = self.performer(x, edge_index = edge_index, pos_emb = layer_pos_emb, output_attentions = output_attentions, **kwargs)
+            x, attn_weights = self.performer(x, *args, pos_emb = layer_pos_emb, output_attentions = output_attentions, **kwargs)
             # norm and to logits
             x = self.norm(x)
             if return_encodings:
@@ -274,7 +280,7 @@ class GraphPerformerLM(nn.Module):
 
             return (x @ self.token_emb.weight.t()), attn_weights
         else:
-            x = self.performer(x, edge_index = edge_index, pos_emb = layer_pos_emb, output_attentions = output_attentions, **kwargs)
+            x = self.performer(x, *args, pos_emb = layer_pos_emb, output_attentions = output_attentions, **kwargs)
 
             # norm and to logits
             x = self.norm(x)
