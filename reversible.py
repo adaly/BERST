@@ -128,6 +128,9 @@ class _ReversibleFunction(Function):
             y, dy = block.backward_pass(y, dy, **kwargs)
         return dy, None, None
 
+# Sequentially apply a series of layers (either Attention-based or FeedForward) to a given input
+# - Handles routing of kwargs to each layer (based on args_route)
+# - Accumulates & averages attention weights across layers, if desired (output_attentions)
 class SequentialSequence(nn.Module):
     def __init__(self, layers, args_route = {}):
         super().__init__()
@@ -158,6 +161,49 @@ class SequentialSequence(nn.Module):
             return x, attn_weights
         else:
             return x
+
+class GraphSequence(SequentialSequence):
+    def __init__(self, layers, graph_layers, args_route = {}):
+        super().__init__(layers, args_route)
+        assert len(layers) == len(graph_layers), 'graph_layers must have same length as layers'
+        self.graph_layers = graph_layers   # boolean indicator of whether each layer uses graph attention information
+            
+    # "*args" has been added so this can be called with (CrossAttention) or without (SelfAttention) edge_index argument
+    def forward(self, x, *args, output_attentions = False, target_nodes = slice(None), **kwargs):
+        rtargs = route_args(self.args_route, kwargs, len(self.layers))
+        layers_and_args = list(zip(self.layers, rtargs))
+
+        if output_attentions:
+            attn_weights = []
+            
+        # self.layers contains tuples of (Attention, FeedForward). Separate layers and arguments:
+        # f: Attention block; f_args: args passed to Attention block
+        # g: FeedForward block; g_args: args passed to FeedForward block
+        for usegraph, ((f, g), (f_args, g_args)) in zip(self.graph_layers, layers_and_args):
+            
+            # Apply Attention layer (f)
+            if output_attentions:
+                if not usegraph:
+                    out = f(x[target_nodes], *args, output_attentions = output_attentions, **f_args)
+                else:
+                    out = f(x, *args, output_attentions = output_attentions, target_nodes=target_nodes, **f_args)
+                x[target_nodes] = x[target_nodes] + out[0]
+                attn_weights.append(out[1].unsqueeze(0))
+            else:
+                if not usegraph:
+                    x[target_nodes] = x[target_nodes] + f(x[target_nodes], *args, **f_args)
+                else:
+                    x[target_nodes] = x[target_nodes] + f(x, *args, target_nodes=target_nodes, **f_args)
+            
+            # Apply token-level feed-forward layer (g)
+            x[target_nodes] = x[target_nodes] + g(x[target_nodes], *args, **g_args)
+        
+        if output_attentions:
+            attn_weights = torch.transpose(torch.cat(attn_weights, dim=0), 0, 1)    # the final dim is (batch, layer, head, len, len)
+            attn_weights = torch.mean(attn_weights, dim=1)                        # the dim is (batch, head, len, len)
+            return x, attn_weights
+        else:
+            return x 
 
 class ReversibleSequence(nn.Module):
     def __init__(self, blocks, args_route = {}):

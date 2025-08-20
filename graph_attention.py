@@ -6,10 +6,11 @@ from io import BytesIO
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
+from torch_geometric.utils import is_undirected
 
 from einops import rearrange
 from functools import partial
-from reversible import ReversibleSequence, SequentialSequence
+from reversible import GraphSequence
 from performer_pytorch import default, cast_tuple, find_modules, get_module_device, exists
 from performer_pytorch import FastAttention, SelfAttention, Gene2VecPositionalEmbedding
 from performer_pytorch import PreLayerNorm, PreScaleNorm, ReZero, Chunk, Always, FeedForward
@@ -61,13 +62,12 @@ class CrossAttention(MessagePassing):
         kv = torch.cat((k,v), -1)  
         return kv
 
-    def forward(self, x, edge_index, output_attentions = False, **kwargs):
+    def forward(self, x, edge_index, output_attentions = False, target_nodes = None,  **kwargs):
         assert x.ndim == 3  # [n_nodes, n_tokens, token_dim]
         n_nodes, n_tokens, token_dim, h = *x.shape, self.heads
 
         # Calculate Q (query) at each ("target") node; to be combined with K (key), V (value) from neighboring ("source") nodes
         q = self.to_q(x)
-        k_this, v_this = self.to_k(x), self.to_v(x) # for debugging purposes
 
         # Flatten nodes & token dim together for message passing;
         # - PyG expects 1d features per node; with batching, it will incorrectly ignore the "tokens" dimension of the input
@@ -77,7 +77,7 @@ class CrossAttention(MessagePassing):
 
         # Expand edge_index to token-level (i.e., edges per token instead of per node after flattening)
         edge_index_token = edge_index.repeat_interleave(n_tokens, dim=1)  # [2, n_edges * n_tokens]
-        offset = torch.arange(n_tokens).repeat(edge_index.size(1))
+        offset = torch.arange(n_tokens).repeat(edge_index.size(1)).to(edge_index.device)
         edge_index_token[0] = edge_index_token[0] * n_tokens + offset
         edge_index_token[1] = edge_index_token[1] * n_tokens + offset
 
@@ -89,6 +89,12 @@ class CrossAttention(MessagePassing):
         # Separate heads into a new dimension
         b, n = n_nodes, n_tokens
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
+
+        # If "target_nodes" specified, only compute attention over desired nodes
+        # -> For the use case where we're iterating over k-hop subgraphs, only updating the central node
+        #    (our cheat to handle supermassive graphs)
+        if target_nodes is not None:
+            q, k, v = q[target_nodes], k[target_nodes], v[target_nodes]
 
         if output_attentions:
             out, attn_weights = self.fast_attention(q, k, v, output_attentions)
@@ -112,8 +118,8 @@ class CrossAttention(MessagePassing):
 ###################################################################################################
 
 class GraphSelfAttention(SelfAttention):
-	def forward(self, x, *args, **kwargs):
-		return super(GraphSelfAttention, self).forward(x, **kwargs)
+    def forward(self, x, *args, **kwargs):
+        return super(GraphSelfAttention, self).forward(x, **kwargs)
 
 class GraphCrossAttention(CrossAttention):
     def forward(self, x, *args, **kwargs):
@@ -121,6 +127,7 @@ class GraphCrossAttention(CrossAttention):
             raise ValueError("GraphCrossAttention expects 'edge_index' as a second argument")
         edge_index = args[0]
         return super(GraphCrossAttention, self).forward(x, edge_index, **kwargs)
+        
 
 ###################################################################################################
 # scBERT-based implementation of language models                                                  #
@@ -177,11 +184,15 @@ class GraphPerformer(nn.Module):
 
         # Sequence classes handle routing of arguments & attention weights through layers 
         # (and apply a residual connection after each layer -- e.g., x = x + f(x))
-        execute_type = ReversibleSequence if reversible else SequentialSequence
+        if reversible:
+            raise NotImplementedError("Have not implemented Reversible layers for graph attention")
+        else:
+            execute_type = GraphSequence
 
         route_attn = ((True, False),) * depth * 2                        # True for Attention-based layers, False for FeedForward
         attn_route_map = {'mask': route_attn, 'pos_emb': route_attn}     # kwargs to route to all Attention-based layers
-        self.net = execute_type(layers, args_route = {**attn_route_map})
+        graph_layers = [False, True] * depth                             # True for layers involving (graph) cross-attention
+        self.net = execute_type(layers, graph_layers, args_route = {**attn_route_map})
 
         # keeping track of when to redraw projections for all attention layers
         self.auto_check_redraw = auto_check_redraw
