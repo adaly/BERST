@@ -54,8 +54,6 @@ class CrossAttention(MessagePassing):
     # Defines what is sent from source (x_j) to target (x_i) nodes
     # TODO: add optional argument for edge features (e.g., distance-based weights)
     def message(self, x_j):
-        #print('x_j.shape:', x_j.shape)  [n_edges * n_tokens, token_dim]
-
         k, v = self.to_k(x_j), self.to_v(x_j)
 
         # Concatenate K and V into a single tensor for message aggregation

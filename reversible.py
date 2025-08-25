@@ -173,6 +173,7 @@ class GraphSequence(SequentialSequence):
         rtargs = route_args(self.args_route, kwargs, len(self.layers))
         layers_and_args = list(zip(self.layers, rtargs))
 
+        # TODO: separately track attentions for graph_layers (so we can distinguish self- and cross-attention)
         if output_attentions:
             attn_weights = []
             
