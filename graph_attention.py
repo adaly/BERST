@@ -40,67 +40,86 @@ class CrossAttention(MessagePassing):
         
         assert dim % heads == 0, 'dimension must be divisible by number of heads'
         dim_head = default(dim_head, dim // heads)
-        inner_dim = dim_head * heads  # multi-head attention achieved by concatenating multiple weight matrices along feature dimension
+        self.inner_dim = dim_head * heads  # multi-head attention achieved by concatenating multiple weight matrices along feature dimension
         
         self.heads = heads
         self.fast_attention = FastAttention(dim_head, nb_features, causal = causal, generalized_attention = generalized_attention, kernel_fn = kernel_fn, no_projection = no_projection)
 
-        self.to_q = nn.Linear(dim, inner_dim, bias = qkv_bias)
-        self.to_k = nn.Linear(dim, inner_dim, bias = qkv_bias)
-        self.to_v = nn.Linear(dim, inner_dim, bias = qkv_bias)
-        self.to_out = nn.Linear(inner_dim, dim)
+        self.to_q = nn.Linear(dim, self.inner_dim, bias = qkv_bias)
+        self.to_k = nn.Linear(dim, self.inner_dim, bias = qkv_bias)
+        self.to_v = nn.Linear(dim, self.inner_dim, bias = qkv_bias)
+        self.to_out = nn.Linear(self.inner_dim, dim)
         self.dropout = nn.Dropout(dropout)
 
     # Defines what is sent from source (x_j) to target (x_i) nodes
     # TODO: add optional argument for edge features (e.g., distance-based weights)
-    def message(self, x_j):
-        k, v = self.to_k(x_j), self.to_v(x_j)
+    def message(self, x_i, x_j, n_tokens, token_dim, output_attentions=False):
+        n_edges = x_i.shape[0]
 
-        # Concatenate K and V into a single tensor for message aggregation
-        kv = torch.cat((k,v), -1)  
-        return kv
+        # Reshape x_i and x_j to separate tokens & embedding (token_dim):
+        x_tgt = x_i.view(n_edges, n_tokens, token_dim)
+        x_src = x_j.view(n_edges, n_tokens, token_dim)
 
-    def forward(self, x, edge_index, output_attentions = False, target_nodes = None,  **kwargs):
-        assert x.ndim == 3  # [n_nodes, n_tokens, token_dim]
-        n_nodes, n_tokens, token_dim, h = *x.shape, self.heads
+        #print('x_tgt:', x_tgt.shape)   # (n_edges, n_tokens, token_dim)
+        #print('x_src:', x_src.shape)   # (n_edges, n_tokens, token_dim)
 
-        # Calculate Q (query) at each ("target") node; to be combined with K (key), V (value) from neighboring ("source") nodes
-        q = self.to_q(x)
+        # Calculate K, V from SOURCE node
+        k, v = self.to_k(x_src), self.to_v(x_src)
 
-        # Flatten nodes & token dim together for message passing;
-        # - PyG expects 1d features per node; with batching, it will incorrectly ignore the "tokens" dimension of the input
-        # - This causes message() to receive a tensor of shape: [total_nodes_across_batch, edges, token_dim]
-        # - ...instead of the expected behavior of:             [edges, tokens, token_dim]
-        x_flat = x.view(n_nodes * n_tokens, token_dim)  # flatten nodes/tokens together; PyG expects 1d features per node for messages
+        # Calculate Q from TARGET node
+        q = self.to_q(x_tgt)
 
-        # Expand edge_index to token-level (i.e., edges per token instead of per node after flattening)
-        edge_index_token = edge_index.repeat_interleave(n_tokens, dim=1)  # [2, n_edges * n_tokens]
-        offset = torch.arange(n_tokens).repeat(edge_index.size(1)).to(edge_index.device)
-        edge_index_token[0] = edge_index_token[0] * n_tokens + offset
-        edge_index_token[1] = edge_index_token[1] * n_tokens + offset
-
-        # Reshape (concatenated) KV tensor to [n_nodes, n_tokens, hidden_dim * 2]
-        kv = self.propagate(edge_index_token, x=x_flat)
-        kv = kv.view(n_nodes, n_tokens, -1)
-        k, v = kv.chunk(2, dim=-1)  # ...then split into separate matrices for attention mechanism
-        
         # Separate heads into a new dimension
-        b, n = n_nodes, n_tokens
+        b, n = n_edges, n_tokens
+        h = self.heads
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = h), (q, k, v))
 
-        # If "target_nodes" specified, only compute attention over desired nodes
-        # -> For the use case where we're iterating over k-hop subgraphs, only updating the central node
-        #    (our cheat to handle supermassive graphs)
-        if target_nodes is not None:
-            q, k, v = q[target_nodes], k[target_nodes], v[target_nodes]
-
+        # Calculate attention
         if output_attentions:
             out, attn_weights = self.fast_attention(q, k, v, output_attentions)
         else:
             out = self.fast_attention(q, k, v)
 
+        # out.shape: (n_edges, heads, n_tokens, dim_head)
+
+        # Subsume head dimension (as expected by to_out Linear layer)
         out = rearrange(out, 'b h n d -> b n (h d)')
+
+        # Flatten for message passing
+        out_flat = out.reshape(n_edges, -1)
+
+        # Tack on (flattened) attention weights, if requested
+        if output_attentions:
+            attn_weights_flat = attn_weights.view(n_edges, -1)
+            out_flat = torch.cat((out_flat, attn_weights_flat), -1)
+
+        return out_flat
+
+    def forward(self, x, edge_index, output_attentions = False, target_nodes = None,  **kwargs):
+        assert x.ndim == 3  # [n_nodes, n_tokens, token_dim]
+        n_nodes, n_tokens, token_dim, h = *x.shape, self.heads
+
+        # Flatten tokens & token dim together for message passing (PyG expects 1d node features)
+        x_flat = x.view(n_nodes, n_tokens * token_dim)
+
+        # Receive aggregated update (flattened)
+        out_flat = self.propagate(edge_index, x=x_flat, n_tokens=n_tokens, token_dim=token_dim, 
+            output_attentions=output_attentions)
+
+        # Separate & reshape attention weights, if provided!
+        if output_attentions:
+            # First (n_tokens * n_heads * dim_head) variables are node features
+            # ...following (n_tokens * n_tokens) variables are attention weights
+            out_flat, attn_weights_flat = torch.split(out_flat, [n_tokens*self.inner_dim, n_tokens**2], dim=1)
+            attn_weights = attn_weights_flat.view(n_nodes, n_tokens, n_tokens)
+
+        # Reshape to (n_nodes, n_tokens, n_heads * dim_head)
+        out = out_flat.view(n_nodes, n_tokens, -1)
+        # ...then pass through final linear layer to project back to token_dim!
         out = self.to_out(out)
+
+        if target_nodes is not None:
+            out = out[target_nodes]
 
         if output_attentions:
             return self.dropout(out), attn_weights
