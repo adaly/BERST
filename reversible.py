@@ -5,6 +5,7 @@ Adapted from scBERT: https://github.com/TencentAILabHealthcare/scBERT/tree/maste
 
 import torch
 import torch.nn as nn
+import numpy as np
 from operator import itemgetter
 from torch.autograd.function import Function
 from torch.utils.checkpoint import get_device_states, set_device_states
@@ -166,7 +167,7 @@ class GraphSequence(SequentialSequence):
     def __init__(self, layers, graph_layers, args_route = {}):
         super().__init__(layers, args_route)
         assert len(layers) == len(graph_layers), 'graph_layers must have same length as layers'
-        self.graph_layers = graph_layers   # boolean indicator of whether each layer uses graph attention information
+        self.graph_layers = np.array(graph_layers, dtype=bool)   # boolean indicator of whether each layer uses graph attention information
             
     # "*args" has been added so this can be called with (CrossAttention) or without (SelfAttention) edge_index argument
     def forward(self, x, *args, output_attentions = False, target_nodes = slice(None), **kwargs):
@@ -189,7 +190,7 @@ class GraphSequence(SequentialSequence):
                 else:
                     out = f(x, *args, output_attentions = output_attentions, target_nodes=target_nodes, **f_args)
                 x[target_nodes] = x[target_nodes] + out[0]
-                attn_weights.append(out[1].unsqueeze(0))
+                attn_weights.append(out[1])
             else:
                 if not usegraph:
                     x[target_nodes] = x[target_nodes] + f(x[target_nodes], *args, **f_args)
@@ -199,9 +200,14 @@ class GraphSequence(SequentialSequence):
             # Apply token-level feed-forward layer (g)
             x[target_nodes] = x[target_nodes] + g(x[target_nodes], *args, **g_args)
         
+        # Return tuple of size: (n, nodes, tokens, tokens), where:
+        # - attn_weights[0] = SelfAttention weights
+        # - attn_weights[1] = CrossAttention weights
         if output_attentions:
-            attn_weights = torch.transpose(torch.cat(attn_weights, dim=0), 0, 1)    # the final dim is (batch, layer, head, len, len)
-            attn_weights = torch.mean(attn_weights, dim=1)                        # the dim is (batch, head, len, len)
+            attn_weights = torch.stack(attn_weights, dim=0)                               # dim: (layer, nodes, tokens, tokens)
+            attn_weights_graph = attn_weights[self.graph_layers].mean(axis=0)
+            attn_weights_self = attn_weights[np.logical_not(self.graph_layers)].mean(axis=0)
+            attn_weights = torch.stack([attn_weights_self, attn_weights_graph], axis=0)   # dim: (2, nodes, tokens, tokens)
             return x, attn_weights
         else:
             return x 

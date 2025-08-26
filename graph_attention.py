@@ -81,7 +81,6 @@ class CrossAttention(MessagePassing):
         # Calculate attention
         if output_attentions:
             out, attn_weights = self.fast_attention(q, k, v, output_attentions)
-            print(out.shape, attn_weights.shape)
         else:
             out = self.fast_attention(q, k, v)
 
