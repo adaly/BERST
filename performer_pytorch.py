@@ -206,6 +206,21 @@ def causal_linear_attention_noncuda(q, k, v, chunk_size = 128):
 def norm_tensor(tensor, dim=-1):
     return tensor / tensor.sum(dim=dim).unsqueeze(dim)
 
+class NaiveAttention(nn.Module):
+    def forward(self, q, k, v, output_attentions = False):
+        scores = torch.matmul(q, k.transpose(-2, -1))
+        attn_weights = (scores / (k.shape[-1] ** 0.5)).softmax(dim = -1)
+        outs = torch.matmul(attn_weights, v)
+
+        if output_attentions:
+            # For multi-head attention, average attention weights across heads (to match FastAttention)
+            if attn_weights.ndim == 4:
+                attn_weights = attn_weights.mean(axis=1)
+            return outs, attn_weights
+        else:
+            return outs
+
+
 class FastAttention(nn.Module):
     def __init__(self, dim_heads, nb_features = None, ortho_scaling = 0, causal = False, generalized_attention = False, kernel_fn = nn.ReLU(), no_projection = False):
         super().__init__()

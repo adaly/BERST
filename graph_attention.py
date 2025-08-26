@@ -12,7 +12,7 @@ from einops import rearrange
 from functools import partial
 from reversible import GraphSequence
 from performer_pytorch import default, cast_tuple, find_modules, get_module_device, exists
-from performer_pytorch import FastAttention, SelfAttention, Gene2VecPositionalEmbedding
+from performer_pytorch import FastAttention, SelfAttention, Gene2VecPositionalEmbedding, NaiveAttention
 from performer_pytorch import PreLayerNorm, PreScaleNorm, ReZero, Chunk, Always, FeedForward
 
 ###################################################################################################
@@ -34,7 +34,8 @@ class CrossAttention(MessagePassing):
         kernel_fn = nn.ReLU(),
         dropout = 0.,
         no_projection = False,
-        qkv_bias = False
+        qkv_bias = False,
+        fast_attention = True
     ):
         super().__init__(aggr="mean", flow="source_to_target")
         
@@ -43,7 +44,10 @@ class CrossAttention(MessagePassing):
         self.inner_dim = dim_head * heads  # multi-head attention achieved by concatenating multiple weight matrices along feature dimension
         
         self.heads = heads
-        self.fast_attention = FastAttention(dim_head, nb_features, causal = causal, generalized_attention = generalized_attention, kernel_fn = kernel_fn, no_projection = no_projection)
+        if fast_attention:
+            self.fast_attention = FastAttention(dim_head, nb_features, causal = causal, generalized_attention = generalized_attention, kernel_fn = kernel_fn, no_projection = no_projection)
+        else:
+            self.fast_attention = NaiveAttention()   # for debugging/testing
 
         self.to_q = nn.Linear(dim, self.inner_dim, bias = qkv_bias)
         self.to_k = nn.Linear(dim, self.inner_dim, bias = qkv_bias)
@@ -77,6 +81,7 @@ class CrossAttention(MessagePassing):
         # Calculate attention
         if output_attentions:
             out, attn_weights = self.fast_attention(q, k, v, output_attentions)
+            print(out.shape, attn_weights.shape)
         else:
             out = self.fast_attention(q, k, v)
 
