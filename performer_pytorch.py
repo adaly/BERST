@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.cuda.amp import autocast
+from torch.nn.attention import sdpa_kernel, SDPBackend
 from einops import rearrange, repeat
 
 import pkgutil
@@ -220,6 +221,50 @@ class NaiveAttention(nn.Module):
         else:
             return outs
 
+# FlashAttention v2 (Dao et al., 2022) — computes exact softmax attention with IO-awareness. 
+# Very efficient for large t.
+class FlashAttention(nn.Module):
+    def __init__(self, causal = False):
+        super().__init__()
+        self.causal = causal
+            
+    def fast_attention_flash(self, q, k, v, attn_mask=None, dropout_p=0.0):
+        """
+        q, k, v: [B, H, T, Dh] (contiguous in the last dim), dtype fp16/bf16
+        attn_mask: broadcastable to [B, H, Tq, Tk] or None
+        """
+        # Ensure tensor-core friendly layout & dtype
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+    
+        # autocast + FlashAttention dispatch
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            # Use FlashAttention if available; if not, MemEfficient (don't use SDPBackend.MATH)
+            with sdpa_kernel(backends=[SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION],
+                             set_priority=True):
+                out = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=attn_mask,
+                    dropout_p=dropout_p,
+                    is_causal=self.causal
+                )
+        return out
+
+    def forward(self, q, k, v, output_attentions=False):
+        out = self.fast_attention_flash(q, k, v)
+        
+        # Compute (n_tokens, n_tokens) attention weights per-head, and average
+        # TODO: SPEEDUP (copied from scBERT; can make faster with FastAttention/approximation?
+        # - SDPA doesn't return attentions, so have to do some form of approximation. Throwing this in here though it wastes time double-computing outs, etc.
+        if output_attentions:
+            fa = FastAttention(dim_heads=q.shape[-1], causal=self.causal)
+            _, attn_weights = fa(q, k, v, output_attentions=True)
+            del fa
+            return out, attn_weights
+            
+        else:
+            return out
 
 class FastAttention(nn.Module):
     def __init__(self, dim_heads, nb_features = None, ortho_scaling = 0, causal = False, generalized_attention = False, kernel_fn = nn.ReLU(), no_projection = False):
@@ -381,7 +426,8 @@ class SelfAttention(nn.Module):
         assert dim % heads == 0, 'dimension must be divisible by number of heads'
         dim_head = default(dim_head, dim // heads)
         inner_dim = dim_head * heads
-        self.fast_attention = FastAttention(dim_head, nb_features, causal = causal, generalized_attention = generalized_attention, kernel_fn = kernel_fn, no_projection = no_projection)
+        #self.fast_attention = FastAttention(dim_head, nb_features, causal = causal, generalized_attention = generalized_attention, kernel_fn = kernel_fn, no_projection = no_projection)
+        self.fast_attention = FlashAttention(causal = causal)
 
         self.heads = heads
         self.global_heads = heads - local_heads
@@ -429,7 +475,7 @@ class SelfAttention(nn.Module):
 
         out = torch.cat(attn_outs, dim = 1)     # combine attn_out and cross_attn_out, here we have only attn_out, that means this line does nothing
         out = rearrange(out, 'b h n d -> b n (h d)')
-        out =  self.to_out(out)
+        out = self.to_out(out.to(torch.float32))
         if output_attentions:
             return self.dropout(out), attn_weights
         else:

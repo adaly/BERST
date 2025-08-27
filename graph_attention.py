@@ -12,7 +12,7 @@ from einops import rearrange
 from functools import partial
 from reversible import GraphSequence
 from performer_pytorch import default, cast_tuple, find_modules, get_module_device, exists
-from performer_pytorch import FastAttention, SelfAttention, Gene2VecPositionalEmbedding, NaiveAttention
+from performer_pytorch import FastAttention, SelfAttention, Gene2VecPositionalEmbedding, NaiveAttention, FlashAttention
 from performer_pytorch import PreLayerNorm, PreScaleNorm, ReZero, Chunk, Always, FeedForward
 
 ###################################################################################################
@@ -35,7 +35,8 @@ class CrossAttention(MessagePassing):
         dropout = 0.,
         no_projection = False,
         qkv_bias = False,
-        fast_attention = True
+        fast_attention = True,
+        attn_chunksize = None
     ):
         super().__init__(aggr="mean", flow="source_to_target")
         
@@ -45,15 +46,42 @@ class CrossAttention(MessagePassing):
         
         self.heads = heads
         if fast_attention:
-            self.fast_attention = FastAttention(dim_head, nb_features, causal = causal, generalized_attention = generalized_attention, kernel_fn = kernel_fn, no_projection = no_projection)
+            #self.fast_attention = FastAttention(dim_head, nb_features, causal = causal, generalized_attention = generalized_attention, kernel_fn = kernel_fn, no_projection = no_projection)
+            self.fast_attention = FlashAttention(causal = causal)
         else:
             self.fast_attention = NaiveAttention()   # for debugging/testing
+        if attn_chunksize is not None:
+            assert isinstance(attn_chunksize, int), 'attn_chunksize must be integer valued if provided'
+        self.attn_chunksize = attn_chunksize
 
         self.to_q = nn.Linear(dim, self.inner_dim, bias = qkv_bias)
         self.to_k = nn.Linear(dim, self.inner_dim, bias = qkv_bias)
         self.to_v = nn.Linear(dim, self.inner_dim, bias = qkv_bias)
         self.to_out = nn.Linear(self.inner_dim, dim)
         self.dropout = nn.Dropout(dropout)
+
+    # Calculates FastAttention separately for each node in order to save GPU memory
+    def fast_attention_chunked(self, q, k, v, output_attentions=False):
+        if self.attn_chunksize is None:
+            return self.fast_attention(q, k, v, output_attentions)
+            
+        n_nodes = q.shape[0]
+        if n_nodes == 1:
+            return self.fast_attention(q, k, v, output_attentions=output_attentions)
+
+        n_chunks = int(np.ceil(float(q.shape[0]) / self.attn_chunksize))   # number of chunks of size attn_chunksize
+        q_chunks = q.chunk(n_chunks, dim = 0)
+        k_chunks = k.chunk(n_chunks, dim = 0)
+        v_chunks = v.chunk(n_chunks, dim = 0)
+        attn_chunks = [self.fast_attention(qc, kc, vc, output_attentions=output_attentions) for qc, kc, vc in zip(q_chunks, k_chunks, v_chunks)]
+        
+        if output_attentions:
+            # Separately combine chunked outputs and attention weights
+            out = torch.cat([c[0] for c in attn_chunks], dim=0)
+            attn_weights = torch.cat([c[1] for c in attn_chunks], dim=0)
+            return out, attn_weights
+        else:
+            return torch.cat(attn_chunks, dim = 0)
 
     # Defines what is sent from source (x_j) to target (x_i) nodes
     # TODO: add optional argument for edge features (e.g., distance-based weights)
@@ -80,9 +108,9 @@ class CrossAttention(MessagePassing):
 
         # Calculate attention
         if output_attentions:
-            out, attn_weights = self.fast_attention(q, k, v, output_attentions)
+            out, attn_weights = self.fast_attention_chunked(q, k, v, output_attentions)
         else:
-            out = self.fast_attention(q, k, v)
+            out = self.fast_attention_chunked(q, k, v)
 
         # out.shape: (n_edges, heads, n_tokens, dim_head)
 
@@ -120,10 +148,12 @@ class CrossAttention(MessagePassing):
         # Reshape to (n_nodes, n_tokens, n_heads * dim_head)
         out = out_flat.view(n_nodes, n_tokens, -1)
         # ...then pass through final linear layer to project back to token_dim!
-        out = self.to_out(out)
+        out = self.to_out(out.to(torch.float32))
 
         if target_nodes is not None:
             out = out[target_nodes]
+            if output_attentions:
+                attn_weights = attn_weights[target_nodes]
 
         if output_attentions:
             return self.dropout(out), attn_weights
@@ -179,6 +209,7 @@ class GraphPerformer(nn.Module):
         no_projection = False,              # ??
         auto_check_redraw = True,           # ??
         qkv_bias = True,                    # ??
+        attn_chunksize = 1                  # number of nodes over which to calculate (cross) attention at a time -- larger = faster but more GPU intensive
     ):
         super().__init__()
         layers = nn.ModuleList([])
@@ -199,7 +230,7 @@ class GraphPerformer(nn.Module):
 
             # Cross-attention (between neighbors), followed by token-level MLP (FeedForward)
             layers.append(nn.ModuleList([
-            	wrapper_fn(GraphCrossAttention(dim, causal = causal, heads = heads, dim_head = dim_head, nb_features = nb_features, generalized_attention = generalized_attention, kernel_fn = kernel_fn, dropout = attn_dropout, no_projection = no_projection, qkv_bias = qkv_bias)),
+            	wrapper_fn(GraphCrossAttention(dim, causal = causal, heads = heads, dim_head = dim_head, nb_features = nb_features, generalized_attention = generalized_attention, kernel_fn = kernel_fn, dropout = attn_dropout, no_projection = no_projection, qkv_bias = qkv_bias, attn_chunksize = attn_chunksize)),
             	wrapper_fn(Chunk(ff_chunks, FeedForward(dim, mult = ff_mult, dropout = ff_dropout, glu = ff_glu), along_dim = 1))
             ]))
 
@@ -275,7 +306,8 @@ class GraphPerformerLM(nn.Module):
         tie_embed = False,                  # False: output is num of tokens, True: output is dim of tokens  //multiply final embeddings with token weights for logits, like gpt decoder//
         g2v_position_emb = True,            # priority: gene2vec, no embedding
         auto_check_redraw = True,
-        qkv_bias = False
+        qkv_bias = False,
+        attn_chunksize = 1
     ):
         super().__init__()
         local_attn_heads = cast_tuple(local_attn_heads)
@@ -292,7 +324,7 @@ class GraphPerformerLM(nn.Module):
 
         self.dropout = nn.Dropout(emb_dropout)
 
-        self.performer = GraphPerformer(dim, depth, heads, dim_head, causal, ff_mult, nb_features, feature_redraw_interval, reversible, ff_chunks, generalized_attention, kernel_fn, use_scalenorm, use_rezero, ff_glu, ff_dropout, attn_dropout, no_projection, auto_check_redraw, qkv_bias)
+        self.performer = GraphPerformer(dim, depth, heads, dim_head, causal, ff_mult, nb_features, feature_redraw_interval, reversible, ff_chunks, generalized_attention, kernel_fn, use_scalenorm, use_rezero, ff_glu, ff_dropout, attn_dropout, no_projection, auto_check_redraw, qkv_bias, attn_chunksize)
         self.norm = nn.LayerNorm(dim)
         self.to_out = nn.Linear(dim, num_tokens) if not tie_embed else None
 
