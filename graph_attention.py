@@ -2,15 +2,16 @@ import numpy as np
 
 import pkgutil
 from io import BytesIO
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 from torch_geometric.nn import MessagePassing
-from torch_geometric.utils import is_undirected
+from torch_geometric.utils import is_undirected, k_hop_subgraph
 
 from einops import rearrange
 from functools import partial
-from reversible import GraphSequence
+from reversible import SequentialSequence, route_args
 from performer_pytorch import default, cast_tuple, find_modules, get_module_device, exists
 from performer_pytorch import FastAttention, SelfAttention, Gene2VecPositionalEmbedding, NaiveAttention, FlashAttention
 from performer_pytorch import PreLayerNorm, PreScaleNorm, ReZero, Chunk, Always, FeedForward
@@ -165,7 +166,7 @@ class CrossAttention(MessagePassing):
 # - BERST has two types of attention: self (within node) and cross (between nodes)                #
 # - Cross-attention requires an additional argument to forward() -- edge_index                    #
 # - Rather than making an explicit argument, wrap both forward() methods to accept *args          #
-# - Makes things modular; same forward() call be be applied in a Sequential network               #
+# - Makes things modular; same forward() call be be applied in a GraphSequence network            #
 ###################################################################################################
 
 class GraphSelfAttention(SelfAttention):
@@ -178,7 +179,120 @@ class GraphCrossAttention(CrossAttention):
             raise ValueError("GraphCrossAttention expects 'edge_index' as a second argument")
         edge_index = args[0]
         return super(GraphCrossAttention, self).forward(x, edge_index, **kwargs)
+
+class GraphSequence(SequentialSequence):
+    def __init__(self, layers, graph_layers, args_route = {}):
+        super().__init__(layers, args_route)
+        assert len(layers) == len(graph_layers), 'graph_layers must have same length as layers'
+        self.graph_layers = np.array(graph_layers, dtype=bool)   # boolean indicator of whether each layer uses graph attention information
+            
+    # Selectively apply a given layer of the sequence to target nodes
+    # (used for subgraph-based mini-batching of large inputs, e.g., Visium/Visium HD)
+    def targeted_apply(self, x, edge_index, output_attentions, target_nodes, f, g, f_args, g_args, usegraph, *args):
+        # Apply Attention layer (f)
+        if output_attentions:
+            if not usegraph:
+                out, attn_weights = f(x[target_nodes], *args, output_attentions = output_attentions, **f_args)
+            else:
+                out, attn_weights = f(x, edge_index, *args, output_attentions = output_attentions, target_nodes=target_nodes, **f_args)
+            out = x[target_nodes] + out
+        else:
+            if not usegraph:
+                out = x[target_nodes] + f(x[target_nodes], *args, **f_args)
+            else:
+                out = x[target_nodes] + f(x, edge_index, *args, target_nodes=target_nodes, **f_args)
         
+        # Apply token-level feed-forward layer (g)
+        out = x[target_nodes] + g(x[target_nodes], *args, **g_args)
+
+        if output_attentions:
+            return out, attn_weights
+        else:
+            return out
+    
+    # "*args" has been added so this can be called with (CrossAttention) or without (SelfAttention) edge_index argument
+    def forward(self, x, edge_index, *args, output_attentions = False, subgraph_batch = False, verbose = False, debug = False, **kwargs):
+        rtargs = route_args(self.args_route, kwargs, len(self.layers))
+        layers_and_args = list(zip(self.layers, rtargs))
+
+        if output_attentions:
+            attn_weights = []
+            
+        # self.layers contains tuples of (Attention, FeedForward). Separate layers and arguments:
+        # f: Attention block; f_args: args passed to Attention block
+        # g: FeedForward block; g_args: args passed to FeedForward block
+        for usegraph, ((f, g), (f_args, g_args)) in zip(self.graph_layers, layers_and_args):
+
+            # SUBGRAPH: Update graph via a series of 1-hop subgraphs (mini-batching)
+            if subgraph_batch:
+                if output_attentions:
+                    node_attn_weights = []
+
+                # Iteratively update each node
+                x_new = torch.zeros_like(x, dtype=x.dtype, device=x.device)  # buffer for node-level updates
+                node_inds = tqdm(range(len(x))) if verbose else range(len(x))
+                for n in node_inds:
+                    subgraph_idx, subgraph_edges, target_nodes, _ = k_hop_subgraph(n, 1, edge_index, relabel_nodes=True, directed=True)
+                    subgraph_feats = x[subgraph_idx]
+                    
+                    if output_attentions:
+                        tgt_update, attn = self.targeted_apply(subgraph_feats, subgraph_edges, output_attentions, target_nodes, f, g, f_args, g_args, usegraph, *args)
+                        node_attn_weights.append(attn)
+                        del attn
+                    else:
+                        tgt_update = self.targeted_apply(subgraph_feats, subgraph_edges, output_attentions, target_nodes, f, g, f_args, g_args, usegraph, *args)
+
+                    # Avoids "in place" assignment (x_new[n] = tgt_update), in which torch saves both versions of tensor
+                    # (before and after update), thus costing memory.
+                    x_new = x_new.index_copy(0, torch.tensor([n], device=x_new.device), tgt_update)
+                    #x_new[n] = tgt_update
+
+                    # delete intermediate tensors related to subgraphs to save memory
+                    del tgt_update, subgraph_feats, subgraph_idx, subgraph_edges, target_nodes
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                # DEBUGGING: compute again on whole graph & compare
+                if debug:
+                    print("DEBUG")
+                    out = self.targeted_apply(x, edge_index, output_attentions, slice(None,), f, g, f_args, g_args, usegraph, *args)
+                    if output_attentions:
+                        assert torch.equal(out[0], x_new)
+                        assert out[1], torch.stack(node_attn_weights, dim=0)
+                    else:
+                        assert torch.equal(out, x_new)
+                    del out
+                
+                x = x_new
+                del x_new
+                if output_attentions:
+                    attn_weights.append(torch.stack(node_attn_weights, dim=0))
+                    del node_attn_weights
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            # WHOLEGRAPH: Update entire graph at once
+            else:
+                # Apply update to entire graph at once
+                target_nodes = slice(None,)
+                if output_attentions:
+                    tgt_update, attn = self.targeted_apply(x, edge_index, output_attentions, target_nodes, f, g, f_args, g_args, usegraph, *args)
+                    attn_weights.append(attn)
+                else:
+                    tgt_update = self.targeted_apply(x, edge_index, output_attentions, target_nodes, f, g, f_args, g_args, usegraph, *args)
+                x[target_nodes] = tgt_update            
+        
+        # Return tensor of size: (n, nodes, tokens, tokens), where:
+        # - attn_weights[0,:,:,:] = SelfAttention weights
+        # - attn_weights[1,:,:,:] = CrossAttention weights
+        if output_attentions:
+            attn_weights = torch.stack(attn_weights, dim=0)                               # dim: (layer, nodes, tokens, tokens)
+            attn_weights_graph = attn_weights[self.graph_layers].mean(axis=0)
+            attn_weights_self = attn_weights[np.logical_not(self.graph_layers)].mean(axis=0)
+            attn_weights = torch.stack([attn_weights_self, attn_weights_graph], axis=0)   # dim: (2, nodes, tokens, tokens)
+            return x, attn_weights
+        else:
+            return x 
 
 ###################################################################################################
 # scBERT-based implementation of language models                                                  #

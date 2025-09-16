@@ -163,55 +163,6 @@ class SequentialSequence(nn.Module):
         else:
             return x
 
-class GraphSequence(SequentialSequence):
-    def __init__(self, layers, graph_layers, args_route = {}):
-        super().__init__(layers, args_route)
-        assert len(layers) == len(graph_layers), 'graph_layers must have same length as layers'
-        self.graph_layers = np.array(graph_layers, dtype=bool)   # boolean indicator of whether each layer uses graph attention information
-            
-    # "*args" has been added so this can be called with (CrossAttention) or without (SelfAttention) edge_index argument
-    def forward(self, x, *args, output_attentions = False, target_nodes = slice(None), **kwargs):
-        rtargs = route_args(self.args_route, kwargs, len(self.layers))
-        layers_and_args = list(zip(self.layers, rtargs))
-
-        # TODO: separately track attentions for graph_layers (so we can distinguish self- and cross-attention)
-        if output_attentions:
-            attn_weights = []
-            
-        # self.layers contains tuples of (Attention, FeedForward). Separate layers and arguments:
-        # f: Attention block; f_args: args passed to Attention block
-        # g: FeedForward block; g_args: args passed to FeedForward block
-        for usegraph, ((f, g), (f_args, g_args)) in zip(self.graph_layers, layers_and_args):
-            
-            # Apply Attention layer (f)
-            if output_attentions:
-                if not usegraph:
-                    out = f(x[target_nodes], *args, output_attentions = output_attentions, **f_args)
-                else:
-                    out = f(x, *args, output_attentions = output_attentions, target_nodes=target_nodes, **f_args)
-                x[target_nodes] = x[target_nodes] + out[0]
-                attn_weights.append(out[1])
-            else:
-                if not usegraph:
-                    x[target_nodes] = x[target_nodes] + f(x[target_nodes], *args, **f_args)
-                else:
-                    x[target_nodes] = x[target_nodes] + f(x, *args, target_nodes=target_nodes, **f_args)
-            
-            # Apply token-level feed-forward layer (g)
-            x[target_nodes] = x[target_nodes] + g(x[target_nodes], *args, **g_args)
-        
-        # Return tuple of size: (n, nodes, tokens, tokens), where:
-        # - attn_weights[0] = SelfAttention weights
-        # - attn_weights[1] = CrossAttention weights
-        if output_attentions:
-            attn_weights = torch.stack(attn_weights, dim=0)                               # dim: (layer, nodes, tokens, tokens)
-            attn_weights_graph = attn_weights[self.graph_layers].mean(axis=0)
-            attn_weights_self = attn_weights[np.logical_not(self.graph_layers)].mean(axis=0)
-            attn_weights = torch.stack([attn_weights_self, attn_weights_graph], axis=0)   # dim: (2, nodes, tokens, tokens)
-            return x, attn_weights
-        else:
-            return x 
-
 class ReversibleSequence(nn.Module):
     def __init__(self, blocks, args_route = {}):
         super().__init__()
