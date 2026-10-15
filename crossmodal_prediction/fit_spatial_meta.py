@@ -30,6 +30,8 @@ parser.add_argument('-m', '--metadata', type=str, default="none", required=False
                     help='Level of metadata to use in encoding -- "tissue", "all", or "none"')
 parser.add_argument('-c', '--tissue-conditioning', action='store_true', required=False,
                     help='Whether to condition spatial layers on tissue_id via FiLM')
+parser.add_argument('-s', '--shuffle-edges', action='store_true', required=False,
+                    help='Whether to shuffle edges prior to training (debugging importance/use of spatial features)')
 args = parser.parse_args()
 
 MODEL_TYPE = args.model_type
@@ -37,6 +39,7 @@ MODEL_DEPTH = args.model_depth
 METADATA = args.metadata
 TISSUE_COND = args.tissue_conditioning
 ACCUM_ITERS = 1
+SHUFFLE = args.shuffle_edges
 
 META_STR = METADATA + '_film1' if TISSUE_COND else METADATA
 
@@ -49,6 +52,8 @@ DEVICE = torch.device(
 print(f"Using device: {DEVICE}")
 
 output_dir = Path('/commons/groups/phatnani_lab/adaly/BERST/results/spatial_meta')
+if SHUFFLE:
+    output_dir = Path('/commons/groups/phatnani_lab/adaly/BERST/results/spatial_meta_shuffle')
 
 #################################  LOAD DATA AND SPLITS  ################################
 
@@ -84,9 +89,26 @@ if METADATA != "none" or TISSUE_COND:
 
 ############################  INSTANTIATE DATASETS & LOADERS  ###########################
 
-train_dataset = VisiumArrayDataset(root_dir, array_ids=train, return_metadata=True)
-val_dataset = VisiumArrayDataset(root_dir, array_ids=val, return_metadata=True)
-test_dataset = VisiumArrayDataset(root_dir, array_ids=test, return_metadata=True)
+train_dataset = VisiumArrayDataset(
+    root_dir, 
+    array_ids=train, 
+    return_metadata=True,
+    shuffle_edges=SHUFFLE
+)
+
+val_dataset = VisiumArrayDataset(
+    root_dir, 
+    array_ids=val, 
+    return_metadata=True,
+    shuffle_edges=SHUFFLE
+)
+
+test_dataset = VisiumArrayDataset(
+    root_dir, 
+    array_ids=test, 
+    return_metadata=True,
+    shuffle_edges=SHUFFLE
+)
 
 # Determine input and output dimensions
 input_dim, n_genes = get_dataset_dimensions(

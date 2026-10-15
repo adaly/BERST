@@ -1,4 +1,5 @@
 import os
+import copy
 import json
 import bisect
 import numpy as np
@@ -484,6 +485,7 @@ class VisiumArrayDataset(Dataset):
         cache_arrays=2,
         return_metadata=False,
         tissue_index=1,
+        shuffle_edges=False,
     ):
         super().__init__()
 
@@ -514,6 +516,9 @@ class VisiumArrayDataset(Dataset):
 
         # Index in categorical metadata containing tissue type
         self.tissue_index = tissue_index
+
+        # For testing the impact of spatial features
+        self.shuffle_edges = shuffle_edges
 
     def __len__(self):
         return len(self.array_ids)
@@ -713,7 +718,14 @@ class VisiumArrayDataset(Dataset):
         return data
 
     def __getitem__(self, idx):
-        return self._load_array(idx)
+        arr = self._load_array(idx)
+
+        if self.shuffle_edges:
+            perm = torch.randperm(arr.edge_index.shape[1])
+            arr = copy.copy(arr)  # shallow copy Data so we don't mutate cached object
+            arr.edge_index = arr.edge_index[:, perm]
+
+        return arr
 
 
 '''
